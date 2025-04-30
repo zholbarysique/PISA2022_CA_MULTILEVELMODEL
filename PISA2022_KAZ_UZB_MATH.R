@@ -273,6 +273,7 @@ kaz_data <- kaz_data %>%
     W_SCHGRNRABWT_rescaled = W_SCHGRNRABWT * adj_factor
   )
 
+
 ##### UZBEKISTAN ####
 ## first, i count students per school in the original dataset (before NA were removed)
 original_counts <- uzb %>%
@@ -297,43 +298,116 @@ response_adjustment <- left_join(original_counts, response_counts, by = "CNTSCHI
     adj_factor = ifelse(n_total > 0, n_orig / n_total, 1)  # default to 1 if no students remained
   )
 
-## finally, i apply adjustment to W_SCHGRNRABWT in kaz_data
+## finally, i apply adjustment to W_SCHGRNRABWT in uzb_data
 uzb_data <- uzb_data %>%
   left_join(response_adjustment %>% select(CNTSCHID, adj_factor), by = "CNTSCHID") %>%
   mutate(
     W_SCHGRNRABWT_rescaled = W_SCHGRNRABWT * adj_factor
   )
 
+###### STUDENT WEIGHT READJUSTMENT FOR NONRESPONSE
+### Kazakhstan ####
+## first, get original total student weights per school (before cleaning)
+stu_weights_orig <- kaz %>%
+  group_by(CNTSCHID) %>%
+  summarize(
+    total_stu_weight_orig = sum(W_FSTUWT, na.rm = TRUE),
+    .groups = 'drop'
+  )
 
+## second, get total student weights after cleaning
+stu_weights_cleaned <- kaz_data %>%
+  group_by(CNTSCHID) %>%
+  summarize(
+    total_stu_weight_cleaned = sum(W_FSTUWT, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+## third, compute adjustment factor
+stu_response_adjustment <- left_join(stu_weights_orig, stu_weights_cleaned, by = "CNTSCHID") %>%
+  mutate(
+    total_stu_weight_cleaned = ifelse(is.na(total_stu_weight_cleaned), 0, total_stu_weight_cleaned),
+    stu_adj_factor = ifelse(total_stu_weight_cleaned > 0,
+                            total_stu_weight_orig / total_stu_weight_cleaned, 1)
+  )
+
+## fourth, apply adjustment
+kaz_data <- kaz_data %>%
+  left_join(stu_response_adjustment %>% select(CNTSCHID, stu_adj_factor), by = "CNTSCHID") %>%
+  mutate(
+    W_FSTUWT_rescaled = W_FSTUWT * stu_adj_factor
+  )
+
+### Uzbekistan ####
+## first, get original total student weights per school (before cleaning)
+stu_weights_orig <- uzb %>%
+  group_by(CNTSCHID) %>%
+  summarize(
+    total_stu_weight_orig = sum(W_FSTUWT, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+## second, get total student weights after cleaning
+stu_weights_cleaned <- uzb_data %>%
+  group_by(CNTSCHID) %>%
+  summarize(
+    total_stu_weight_cleaned = sum(W_FSTUWT, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+## third, compute adjustment factor
+stu_response_adjustment <- left_join(stu_weights_orig, stu_weights_cleaned, by = "CNTSCHID") %>%
+  mutate(
+    total_stu_weight_cleaned = ifelse(is.na(total_stu_weight_cleaned), 0, total_stu_weight_cleaned),
+    stu_adj_factor = ifelse(total_stu_weight_cleaned > 0,
+                            total_stu_weight_orig / total_stu_weight_cleaned, 1)
+  )
+
+## fourth, apply adjustment
+uzb_data <- uzb_data %>%
+  left_join(stu_response_adjustment %>% select(CNTSCHID, stu_adj_factor), by = "CNTSCHID") %>%
+  mutate(
+    W_FSTUWT_rescaled = W_FSTUWT * stu_adj_factor
+  )
 
 ########################## REGRESSION MODEL FUNCTION ##########################
 library(lme4)
 library(dplyr)
+library(WeMix)
 
-my_regression <- function(data, y_names, x_formula, cluster_var, sch_weights_var, rep_weights) {
+library(future.apply)
+plan(multisession, workers = 6)  # or multicore if Linux/Mac
+
+my_regression <- function(data, y_names, x_formula, cluster_var, stu_weights_var, sch_weights_var, rep_weights) {
   
-  M <- length(y_names) ## number of plausible values
-  R <- length(rep_weights) ## number of replication weights
+  M <- length(y_names)  # number of plausible values
+  R <- length(rep_weights)  # number of replicate weights
   
+  stu_weights <- stu_weights_var
+  sch_weights <- sch_weights_var
+  
+  # Prepare formulas once
+  formula_list <- lapply(y_names, function(pv) {
+    as.formula(paste(pv, "~", x_formula, "+ (1 |", cluster_var, ")"))
+  })
+  names(formula_list) <- y_names
+  
+  ## Main estimates
   estimates_main <- list()
   var_main <- list()
-  
+
   for (pv in y_names) {
+    formula <- formula_list[[pv]]
     
-    formula <- as.formula(paste(pv, "~", x_formula, "+ (1 |", cluster_var, ")"))
-    model <- tryCatch(
-      lmer(formula, 
-           data = data, 
-           weights = data[[sch_weights_var]]),
-      error = function(e) {
-        message(paste("model failed for ", pv, ":", e$message))
-        return(NULL)
-      }
+    model <- mix(
+      formula = formula,
+      data = data,
+      weights = c(stu_weights, sch_weights)
     )
     
     if (!is.null(model)) {
-      estimates_main[[pv]] <- fixef(model)
-      var_main[[pv]] <- diag(vcov(model))
+      estimates_main[[pv]] <- coef(model)
+      var_main[[pv]] <- diag(model[["vars"]])
     }
   }
   
@@ -343,59 +417,52 @@ my_regression <- function(data, y_names, x_formula, cluster_var, sch_weights_var
   pooled_mean <- colMeans(est_matrix_main)
   
   W <- colMeans(do.call(rbind, var_main))  # Within-imputation variance
+  B <- colSums((est_matrix_main - pooled_mean)^2) / (M - 1)  # Between-imputation variance
   
-  # Between-imputation variance
-  B <- apply(est_matrix_main, 2, function(x) {
-    sum((x - mean(x))^2) / (M - 1)
-  })
+  ## Replication part using for loop
+  replicate_estimates <- matrix(NA, nrow = R, ncol = length(pooled_mean))
   
-  ## Replication part
-  replicate_estimates <- array(NA, dim = c(R, length(pooled_mean)))
-  colnames(replicate_estimates) <- names(pooled_mean)
-  
-  for (r in seq_along(rep_weights)) {
-    rw <- rep_weights[r]
+  for (i in seq_along(rep_weights)) {
+    rw <- rep_weights[[i]]
     est_matrix_rep <- matrix(NA, nrow = M, ncol = length(pooled_mean))
     
     for (m in seq_along(y_names)) {
-      pv <- y_names[m]
-      formula <- as.formula(paste(pv, "~", x_formula, "+ (1 |", cluster_var, ")"))
+      formula <- formula_list[[m]]
+      
       model <- tryCatch(
-        lmer(formula, 
-             data = data, 
-             weights = data[[rw]],
-             control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
-        error = function(e) return(NULL)
+        mix(
+          formula = formula,
+          data = data,
+          weights = c(rw, sch_weights)
+        ),
+        error = function(e) NULL
       )
       
       if (!is.null(model)) {
-        est_matrix_rep[m, ] <- fixef(model)
+        est_matrix_rep[m, ] <- coef(model)
       }
     }
-    replicate_estimates[r, ] <- colMeans(est_matrix_rep, na.rm = TRUE)
+    replicate_estimates[i, ] <- colMeans(est_matrix_rep, na.rm = TRUE)
   }
   
-  ## BRR sampling variance according to the formula: 0.05 * sum((X_t - X_mean)^2)
+  ## Replication variance BRR
   replicate_diff <- sweep(replicate_estimates, 2, pooled_mean)
-  V_brr <- 0.05 * colSums(replicate_diff^2) 
+  V_brr <- 0.05 * colSums(replicate_diff^2)
   
-  ## Total variance: B + V_brr
+  ## Total variance
   total_variance <- B + V_brr
   pooled_se <- sqrt(total_variance)
   
-  ## t, df and p
+  ## t-values, degrees of freedom, p-values
   t_values <- pooled_mean / pooled_se
   
   df_raw <- ((1 + 1/M)^2 * B^2) / ((B^2)/(M - 1) + (V_brr^2)/R)
-  
-  # If B is ~0 (numerical stability), fall back to M - 1
   df <- ifelse(B < 1e-10, M - 1, df_raw)
-  
-  # Optional: cap df to reasonable range to avoid instability
   df <- pmax(df, 5)
   
   p_values <- 2 * pt(abs(t_values), df, lower.tail = FALSE)
   
+  ## Assemble results
   results <- data.frame(
     Variable = names(pooled_mean),
     Estimate = pooled_mean,
@@ -409,11 +476,14 @@ my_regression <- function(data, y_names, x_formula, cluster_var, sch_weights_var
 }
 
 
+
+
 ########################## MODEL ##########################
 
 ######### null model #########
 y_names <- paste0("PV", 1:10, "MATH")
 cluster_var = "CNTSCHID"
+stu_weights_var = "W_FSTUWT"
 sch_weights_var = "W_SCHGRNRABWT_rescaled"
 rep_weights = paste0("W_FSTURWT", 1:80)
 
@@ -427,6 +497,7 @@ kaz_m0_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -437,6 +508,7 @@ uzb_m0_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -451,6 +523,7 @@ kaz_m1_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -461,6 +534,7 @@ uzb_m1_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -476,6 +550,7 @@ kaz_m1.1_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -486,6 +561,7 @@ uzb_m1.1_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -501,6 +577,7 @@ kaz_m2_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -511,6 +588,7 @@ uzb_m2_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -529,6 +607,7 @@ kaz_m2.1_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -539,6 +618,7 @@ uzb_m2.1_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -556,6 +636,7 @@ kaz_m3_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -569,6 +650,7 @@ uzb_m3_results <- my_regression(
   y_names = y_names,
   x_formula = x_formula,
   cluster_var = cluster_var,
+  stu_weights_var = stu_weights_var,
   sch_weights_var = sch_weights_var,
   rep_weights = rep_weights
 )
@@ -597,8 +679,8 @@ uzb_results_list <- list(
 )
 
 # Write to Excel file
-write_xlsx(kaz_results_list, path = "PISA2022_KAZ_model_results_27042025.xlsx")
-write_xlsx(uzb_results_list, path = "PISA2022_UZB_model_results_27042025.xlsx")
+write_xlsx(kaz_results_list, path = "PISA2022_KAZ_model_results_29042025.xlsx")
+write_xlsx(uzb_results_list, path = "PISA2022_UZB_model_results_29042025.xlsx")
 
 
 
