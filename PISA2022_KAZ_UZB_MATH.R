@@ -371,119 +371,125 @@ uzb_data <- uzb_data %>%
   )
 
 ########################## REGRESSION MODEL FUNCTION ##########################
-library(lme4)
 library(dplyr)
 library(WeMix)
+library(parallel)
 
-library(future.apply)
-plan(multisession, workers = 6)  # or multicore if Linux/Mac
-
-my_regression <- function(data, y_names, x_formula, cluster_var, stu_weights_var, sch_weights_var, rep_weights) {
+### works on macos better, i guess
+my_regression_parallel <- function(data, y_names, x_formula, cluster_var, 
+                          stu_weights_var, sch_weights_var, rep_weights) {
   
-  M <- length(y_names)  # number of plausible values
-  R <- length(rep_weights)  # number of replicate weights
+  M <- length(y_names)         
+  R <- length(rep_weights)
+  n_cores <- min(6, detectCores()) 
   
-  stu_weights <- stu_weights_var
-  sch_weights <- sch_weights_var
-  
-  # Prepare formulas once
+  ## save formulas for each PV as list
   formula_list <- lapply(y_names, function(pv) {
     as.formula(paste(pv, "~", x_formula, "+ (1 |", cluster_var, ")"))
   })
   names(formula_list) <- y_names
   
-  ## Main estimates
-  estimates_main <- list()
-  var_main <- list()
-
-  for (pv in y_names) {
-    formula <- formula_list[[pv]]
+  ## i am setting up parallel clustering
+  cl <- makeCluster(n_cores)
+  
+  ## exporting required objects and packages to each worker
+  clusterExport(cl, varlist = c("data", "y_names", "x_formula", "cluster_var", 
+                                "stu_weights_var", "sch_weights_var", 
+                                "rep_weights", "formula_list", "M", "mix"), envir = environment())
+  
+  clusterEvalQ(cl, {
+    library(WeMix) ## we'll use it for mix() function
+  })
+  
+  ## main coef estimates are calculated here
+  estimates_main <- parLapply(cl, seq_along(y_names), function(m) {
+    pv <- y_names[m]
+    formula <- formula_list[[m]]
     
-    model <- mix(
-      formula = formula,
-      data = data,
-      weights = c(stu_weights, sch_weights)
+    model <- tryCatch(
+      mix(formula = formula, data = data, weights = c(stu_weights_var, sch_weights_var)),
+      error = function(e) NULL
     )
     
     if (!is.null(model)) {
-      estimates_main[[pv]] <- coef(model)
-      var_main[[pv]] <- diag(model[["vars"]])
+      coefs <- coef(model)
+      return(coefs)
+    } else {
+      return(rep(NA, length(attr(terms(formula), "term.labels")) + 1))
     }
-  }
-  
-  if (length(estimates_main) == 0) stop("All models failed")
+  })
   
   est_matrix_main <- do.call(rbind, estimates_main)
-  pooled_mean <- colMeans(est_matrix_main)
+  pooled_mean <- colMeans(est_matrix_main, na.rm = TRUE) ## these are main regression coef estimates
   
-  W <- colMeans(do.call(rbind, var_main))  # Within-imputation variance
-  B <- colSums((est_matrix_main - pooled_mean)^2) / (M - 1)  # Between-imputation variance
-  
-  ## Replication part using for loop
-  replicate_estimates <- matrix(NA, nrow = R, ncol = length(pooled_mean))
-  
-  for (i in seq_along(rep_weights)) {
-    rw <- rep_weights[[i]]
-    est_matrix_rep <- matrix(NA, nrow = M, ncol = length(pooled_mean))
+  ## imputation variance is calculated here :
+  centered <- sweep(est_matrix_main, 2, pooled_mean)
+  B <- colSums(centered^2, na.rm = TRUE) / (M - 1)
+
+  ## replication estimates are calculated here:
+  replicate_estimates <- parLapply(cl, seq_along(rep_weights), function(i) {
+    rw_name <- rep_weights[i]
     
-    for (m in seq_along(y_names)) {
+    rep_ests <- do.call(rbind, lapply(seq_along(y_names), function(m) {
       formula <- formula_list[[m]]
       
       model <- tryCatch(
-        mix(
-          formula = formula,
-          data = data,
-          weights = c(rw, sch_weights)
-        ),
+        mix(formula = formula, data = data, weights = c(rep_weights[i], sch_weights_var)),
         error = function(e) NULL
       )
       
-      if (!is.null(model)) {
-        est_matrix_rep[m, ] <- coef(model)
-      }
-    }
-    replicate_estimates[i, ] <- colMeans(est_matrix_rep, na.rm = TRUE)
-  }
+      if (!is.null(model)) coef(model) else rep(NA, length(pooled_mean))
+    }))
+    
+    colMeans(rep_ests, na.rm = TRUE)
+  })
   
-  ## Replication variance BRR
-  replicate_diff <- sweep(replicate_estimates, 2, pooled_mean)
-  V_brr <- 0.05 * colSums(replicate_diff^2)
+  stopCluster(cl)  ## ! stop the cluster
   
-  ## Total variance
+  replicate_matrix <- do.call(rbind, replicate_estimates)
+  
+  ## sampling variance is calculated here:
+  replicate_diff <- sweep(replicate_matrix, 2, pooled_mean)
+  V_brr <- 0.05 * colSums(replicate_diff^2, na.rm = TRUE)
+  
+  ## total variance = imputation variance + sampling variance
   total_variance <- B + V_brr
   pooled_se <- sqrt(total_variance)
   
-  ## t-values, degrees of freedom, p-values
+  ## Welch-Satterthwaite DoF is calculated here:
+  J <- R
+  dof_ws_num <- (colSums(replicate_diff^2)^2)
+  dof_ws_den <- colSums(replicate_diff^4)
+  dof_ws <- dof_ws_num / dof_ws_den
+  
+  ## jackknife rescaling of Dof is performed here:
+  dof <- (3.16 - (2.77 / sqrt(J))) * dof_ws
+  dof[is.na(dof) | dof < 1] <- 5
+  
+  ## p and t
   t_values <- pooled_mean / pooled_se
+  p_values <- 2 * pt(abs(t_values), df = dof, lower.tail = FALSE)
   
-  df_raw <- ((1 + 1/M)^2 * B^2) / ((B^2)/(M - 1) + (V_brr^2)/R)
-  df <- ifelse(B < 1e-10, M - 1, df_raw)
-  df <- pmax(df, 5)
-  
-  p_values <- 2 * pt(abs(t_values), df, lower.tail = FALSE)
-  
-  ## Assemble results
+  ## results of regression are stored as dataframe
   results <- data.frame(
     Variable = names(pooled_mean),
     Estimate = pooled_mean,
     SE = pooled_se,
     t_value = t_values,
-    df = df,
+    df = dof,
     p_value = p_values
   )
-  
   return(results)
 }
 
 
-
-
 ########################## MODEL ##########################
+library(tictoc) ## i would like to measure how much time is spent on running one mode
 
 ######### null model #########
 y_names <- paste0("PV", 1:10, "MATH")
 cluster_var = "CNTSCHID"
-stu_weights_var = "W_FSTUWT"
+stu_weights_var = "W_FSTUWT_rescaled"
 sch_weights_var = "W_SCHGRNRABWT_rescaled"
 rep_weights = paste0("W_FSTURWT", 1:80)
 
@@ -491,8 +497,8 @@ x_formula <- "1"
 
 kz_d = kaz_data ## kaz dataset
 uz_d = uzb_data ## uzb dataset
-
-kaz_m0_results <- my_regression(
+tic("null kaz model:")
+kaz_m0_results <- my_regression_parallel(
   data = kz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -502,8 +508,9 @@ kaz_m0_results <- my_regression(
   rep_weights = rep_weights
 )
 print(kaz_m0_results)
+toc() ## 2970.411 sec elapsed :(
 
-uzb_m0_results <- my_regression(
+uzb_m0_results <- my_regression_parallel(
   data = uz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -518,7 +525,7 @@ print(uzb_m0_results)
 x_formula <- c("gender_female  + ESCS_grand_mean + GRADE + READ_centered +
                 ANXMAT_grand_mean + MATHEF21_grand_mean + MATHMOT + 
                 MATHPERS_grand_mean")
-kaz_m1_results <- my_regression(
+kaz_m1_results <- my_regression_parallel(
   data = kz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -529,7 +536,7 @@ kaz_m1_results <- my_regression(
 )
 print(kaz_m1_results)
 
-uzb_m1_results <- my_regression(
+uzb_m1_results <- my_regression_parallel(
   data = uz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -545,7 +552,7 @@ x_formula <- c("ESCS_grand_mean + GRADE +
                 gender_female*READ_centered + gender_female*ANXMAT_grand_mean + 
                 gender_female*MATHEF21_grand_mean + gender_female*MATHMOT + 
                gender_female*MATHPERS_grand_mean")
-kaz_m1.1_results <- my_regression(
+kaz_m1.1_results <- my_regression_parallel(
   data = kz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -556,7 +563,7 @@ kaz_m1.1_results <- my_regression(
 )
 print(kaz_m1.1_results)
 
-uzb_m1.1_results <- my_regression(
+uzb_m1.1_results <- my_regression_parallel(
   data = uz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -572,7 +579,7 @@ print(uzb_m1.1_results)
 x_formula <- c("gender_female + ESCS_grand_mean + GRADE + READ_centered + ANXMAT_grand_mean + 
                MATHEF21_grand_mean + MATHMOT + MATHPERS_grand_mean + 
               school_private + MCLSIZE + EDUSHORT")
-kaz_m2_results <- my_regression(
+kaz_m2_results <- my_regression_parallel(
   data = kz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -583,7 +590,7 @@ kaz_m2_results <- my_regression(
 )
 print(kaz_m2_results)
 
-uzb_m2_results <- my_regression(
+uzb_m2_results <- my_regression_parallel(
   data = uz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -602,7 +609,7 @@ x_formula <- c("ESCS_grand_mean + GRADE +
                 gender_female*MATHPERS_grand_mean + 
                 school_private +
                 MCLSIZE + EDUSHORT")
-kaz_m2.1_results <- my_regression(
+kaz_m2.1_results <- my_regression_parallel(
   data = kz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -613,7 +620,7 @@ kaz_m2.1_results <- my_regression(
 )
 print(kaz_m2.1_results)
 
-uzb_m2.1_results <- my_regression(
+uzb_m2.1_results <- my_regression_parallel(
   data = uz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -625,13 +632,13 @@ uzb_m2.1_results <- my_regression(
 print(uzb_m2.1_results)
 
 
-
 ## final model
 x_formula <- c("GRADE + gender_female*READ_centered + 
                 gender_female*ANXMAT_grand_mean + 
-                MATHEF21_grand_mean + 
+                MATHEF21_grand_mean + MATHMOT +
+                gender_female*MATHPERS_grand_mean +
                school_private + EDUSHORT")
-kaz_m3_results <- my_regression(
+kaz_m3_results <- my_regression_parallel(
   data = kz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -643,9 +650,9 @@ kaz_m3_results <- my_regression(
 print(kaz_m3_results)
 
 
-x_formula <- c("gender_female + READ_centered + ANXMAT_grand_mean + 
+x_formula <- c("gender_female*READ_centered + ANXMAT_grand_mean + 
                MATHEF21_grand_mean + MATHMOT + MCLSIZE")
-uzb_m3_results <- my_regression(
+uzb_m3_results <- my_regression_parallel(
   data = uz_d,
   y_names = y_names,
   x_formula = x_formula,
@@ -678,10 +685,7 @@ uzb_results_list <- list(
   "Model_3" = uzb_m3_results
 )
 
+
 # Write to Excel file
-write_xlsx(kaz_results_list, path = "PISA2022_KAZ_model_results_29042025.xlsx")
-write_xlsx(uzb_results_list, path = "PISA2022_UZB_model_results_29042025.xlsx")
-
-
-
-
+write_xlsx(kaz_results_list, path = "PISA2022_KAZ_model_results_01052025.xlsx")
+write_xlsx(uzb_results_list, path = "PISA2022_UZB_model_results_01052025.xlsx")
