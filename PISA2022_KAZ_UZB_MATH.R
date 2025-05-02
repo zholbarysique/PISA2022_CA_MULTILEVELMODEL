@@ -234,9 +234,15 @@ uzb_result[4,] <- calculate_stats(varname = "MATHMOT",
                                   sd_0 = uzb_mathpers$SD[1], sd_1 = uzb_mathpers$SD[2],
                                   n_0 = uzb_mathpers$Freq[1], n_1 = uzb_mathpers$Freq[2])
 
-writexl::write_xlsx(kaz_result, "PISA2022_KAZ_MEAN_DIFF_27042025.xlsx")
-writexl::write_xlsx(uzb_result, "PISA2022_UZB_MEAN_DIFF_27042025.xlsx")
+write_xlsx(
+  kaz_result,
+  path = paste0("PISA2022_KAZ_MEAN_DIFF_", Sys.Date(), ".xlsx")
+)
 
+write_xlsx(
+  uzb_result,
+  path = paste0("PISA2022_UZB_MEAN_DIFF_", Sys.Date(), ".xlsx")
+)
 
 ########################## SCALING SCH WEIGHTS TO ADJUST FOR NONRESPONSE ##########################
 ## https://unstats.un.org/unsd/demographic/meetings/egm/sampling_1203/docs/no_5.pdf
@@ -686,6 +692,11 @@ uzb_results_list <- list(
 )
 
 
-# Write to Excel file
-write_xlsx(kaz_results_list, path = "PISA2022_KAZ_model_results_01052025.xlsx")
-write_xlsx(uzb_results_list, path = "PISA2022_UZB_model_results_01052025.xlsx")
+write_xlsx(
+  kaz_results_list,
+  path = paste0("PISA2022_KAZ_model_results_", Sys.Date(), ".xlsx")
+)
+write_xlsx(
+  uzb_results_list,
+  path = paste0("PISA2022_UZB_model_results_", Sys.Date(), ".xlsx")
+)
